@@ -1,48 +1,64 @@
 #!/usr/bin/env node
+import express from "express";
 import { ethers } from "ethers";
 import dotenv from "dotenv";
 import fs from "fs";
-import { parseArgs } from "./src/lib/args.js";
-import { sleep, randomDecimalString, confirmPrompt } from "./src/lib/common.js";
+import { sleep, randomDecimalString } from "./src/lib/common.js";
 import { ERC20_ABI, CHAIN_ID_LINEA } from "./src/constant/constant.js";
 
 dotenv.config();
 
-(async function main() {
+const app = express();
+app.use(express.json());
+
+const jobs = new Map();
+
+const apiKeyAuth = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'];
+  const validApiKey = process.env.API_KEY;
+
+  if (!validApiKey) {
+    return res.status(500).json({ error: "API_KEY not configured on server" });
+  }
+
+  if (!apiKey || apiKey !== validApiKey) {
+    return res.status(401).json({ error: "Unauthorized: Invalid or missing API key" });
+  }
+
+  next();
+};
+
+async function executeBatch(jobId, config) {
+  const job = jobs.get(jobId);
+  
   try {
-    const args = parseArgs();
+    job.status = "running";
+    job.startTime = Date.now();
 
     const privateKey = process.env.PRIVATE_KEY;
     if (!privateKey) {
-      console.error("PRIVATE_KEY not set in environment (.env). Aborting.");
-      process.exit(1);
+      throw new Error("PRIVATE_KEY not set in environment");
     }
 
-    const provider = new ethers.JsonRpcProvider(args.rpc);
-    try {
-      await provider.getBlockNumber();
-    } catch (e) {
-      console.error("Cannot connect to RPC:", e.message || e);
-      process.exit(1);
-    }
+    const provider = new ethers.JsonRpcProvider(config.rpc);
+    await provider.getBlockNumber();
 
     const wallet = new ethers.Wallet(privateKey, provider);
     const sender = await wallet.getAddress();
-    if (args.verbose) console.log("Using wallet:", sender);
+    job.wallet = sender;
 
-    const tokenAddress = ethers.getAddress(args.token);
-    const toAddress = ethers.getAddress(args.to);
+    const tokenAddress = ethers.getAddress(config.token);
+    const toAddress = ethers.getAddress(config.to);
     const contract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
 
     const decimals = Number(await contract.decimals());
-    if (args.verbose) console.log("Token decimals:", decimals);
-
     const tokenBalanceUnits = await contract.balanceOf(sender);
-    const tokenBalanceFormatted = ethers.formatUnits(tokenBalanceUnits, decimals);
-    if (args.verbose) console.log("Token balance:", tokenBalanceFormatted);
-
     const nativeBalanceWei = await provider.getBalance(sender);
-    if (args.verbose) console.log("Native balance (ETH-ish):", ethers.formatEther(nativeBalanceWei));
+
+    job.balances = {
+      token: ethers.formatUnits(tokenBalanceUnits, decimals),
+      native: ethers.formatEther(nativeBalanceWei)
+    };
 
     let estimatedGasPerTx = 120000;
     try {
@@ -50,69 +66,39 @@ dotenv.config();
       const gasEstimate = await contract.transfer.estimateGas(toAddress, sampleAmountUnits);
       estimatedGasPerTx = Number(gasEstimate);
     } catch (e) {
-      if (args.verbose) console.warn("Could not estimate gas precisely, using fallback:", estimatedGasPerTx, "Error:", e.message);
+      job.warnings = job.warnings || [];
+      job.warnings.push(`Could not estimate gas: ${e.message}`);
     }
-    if (args.verbose) console.log("Estimated gas per tx:", estimatedGasPerTx);
 
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice || ethers.parseUnits("1", "gwei");
-    const estTotalGasCost = gasPrice * BigInt(Math.ceil(estimatedGasPerTx * args.count));
-    if (args.verbose) console.log("Current gasPrice (wei):", gasPrice.toString());
-    if (args.verbose) console.log("Estimated total gas cost (wei):", estTotalGasCost.toString(), " (~", ethers.formatEther(estTotalGasCost), "ETH )");
-
-    if (nativeBalanceWei < estTotalGasCost) {
-      if (args.verbose) console.warn("Warning: native balance is less than estimated total gas cost — transactions may fail.");
-    }
 
     const planned = [];
     let sumUnits = 0n;
-    for (let i = 0; i < args.count; ++i) {
-      const rndStr = randomDecimalString(args.min, args.max, 4);
+    for (let i = 0; i < config.count; ++i) {
+      const rndStr = randomDecimalString(config.min, config.max, 4);
       const units = ethers.parseUnits(rndStr, decimals);
       planned.push({ display: rndStr, units });
       sumUnits = sumUnits + units;
     }
-    if (args.verbose) console.log("Total planned token amount (units):", sumUnits.toString(), " -> tokens:", ethers.formatUnits(sumUnits, decimals));
+
     if (sumUnits > tokenBalanceUnits) {
-      console.error("Planned total exceeds token balance. Aborting.");
-      process.exit(1);
+      throw new Error("Planned total exceeds token balance");
     }
 
-    const summary = `
-SUMMARY
-  Sender: ${sender}
-  Token: ${tokenAddress}
-  To: ${toAddress}
-  Count: ${args.count}
-  Total tokens to send: ${ethers.formatUnits(sumUnits, decimals)}
-  Estimated total gas (wei): ${estTotalGasCost.toString()} (~${ethers.formatEther(estTotalGasCost)} ETH)
-`;
-    const ok = await confirmPrompt(summary);
-    if (!ok) {
-      console.log("Aborted by user.");
-      process.exit(0);
-    }
-
-    if (args["dry-run"]) {
-      console.log("Dry-run mode: no transactions will be broadcast.");
-      planned.forEach((p, i) => {
-        console.log(`Planned #${i + 1}: ${p.display} tokens -> units ${p.units.toString()}`);
-      });
-      process.exit(0);
-    }
+    job.planned = {
+      total: ethers.formatUnits(sumUnits, decimals),
+      count: config.count
+    };
 
     const txLog = [];
-    const startTime = Date.now();
     for (let i = 0; i < planned.length; ++i) {
       const { display, units } = planned[i];
-      if (units === 0n) {
-        if (args.verbose) console.warn(`Skipping tx #${i + 1} because units == 0`);
-        continue;
-      }
+      if (units === 0n) continue;
 
       let attempt = 0;
       let success = false;
-      while (attempt < args.retries && !success) {
+      while (attempt < config.retries && !success) {
         attempt++;
         try {
           const nonce = await provider.getTransactionCount(sender, "pending");
@@ -140,56 +126,165 @@ SUMMARY
 
           const signed = await wallet.signTransaction(txRequest);
           const sent = await provider.broadcastTransaction(signed);
-          if (args.verbose) console.log(`Sent tx #${i + 1} amount=${display} tokens (units=${units.toString()}) nonce=${nonce} hash=${sent.hash}`);
 
-          const receipt = await sent.wait(1).catch((err) => {
-            if (args.verbose) console.warn(`Waiting for receipt for tx ${sent.hash} failed/timeout:`, err.message || err);
-            return null;
+          const receipt = await sent.wait(1).catch(() => null);
+
+          txLog.push({ 
+            index: i + 1, 
+            amount: display, 
+            units: units.toString(), 
+            nonce, 
+            hash: sent.hash,
+            blockNumber: receipt?.blockNumber,
+            status: receipt?.status
           });
-
-          if (receipt) {
-            if (args.verbose) console.log(`Confirmed tx #${i + 1} in block ${receipt.blockNumber} status=${receipt.status}`);
-          } else {
-            console.warn(`No receipt yet for tx ${sent.hash}. Continueing - check this hash manually.`);
-          }
-
-          txLog.push({ index: i + 1, amount: display, units: units.toString(), nonce, hash: sent.hash });
           success = true;
 
-          if (args.delay && args.delay > 0) await sleep(Math.round(args.delay * 1000));
+          if (config.delay && config.delay > 0) await sleep(Math.round(config.delay * 1000));
         } catch (err) {
-          console.error(`Attempt ${attempt} failed for tx #${i + 1}:`, err.message || err);
-          const backoff = Math.min(5000 * attempt, 30000);
-          console.log(`Retrying in ${backoff / 1000}s...`);
-          await sleep(backoff);
-          if (attempt >= args.retries) {
-            console.error(`Max retries reached for tx #${i + 1}. Aborting remaining transactions.`);
-            const logDir = args.log || ".";
-            const timestamp = Math.floor(Date.now() / 1000);
-            const logPath = `${logDir}/${timestamp}.txlog.json`;
-            if (!fs.existsSync(logDir)) {
-              fs.mkdirSync(logDir, { recursive: true });
-            }
-            fs.writeFileSync(logPath, JSON.stringify(txLog, null, 2));
-            process.exit(1);
+          if (attempt >= config.retries) {
+            throw new Error(`Max retries reached for tx #${i + 1}: ${err.message}`);
           }
+          const backoff = Math.min(5000 * attempt, 30000);
+          await sleep(backoff);
         }
       }
+
+      job.completed = i + 1;
+      job.transactions = txLog;
     }
 
-    const logDir = args.log || "logs";
+    const logDir = config.logDir || "logs";
     const timestamp = Math.floor(Date.now() / 1000);
     const logPath = `${logDir}/${timestamp}.txlog.json`;
     if (!fs.existsSync(logDir)) {
       fs.mkdirSync(logDir, { recursive: true });
     }
     fs.writeFileSync(logPath, JSON.stringify(txLog, null, 2));
-    
+
     const endTime = Date.now();
-    const duration = ((endTime - startTime) / 1000).toFixed(2);
-    console.log(`All done in ${duration}s. Tx log saved to ${logPath}`);
+    const duration = ((endTime - job.startTime) / 1000).toFixed(2);
+
+    job.status = "completed";
+    job.duration = duration;
+    job.logPath = logPath;
+    job.transactions = txLog;
+    job.endTime = endTime;
+
   } catch (err) {
-    console.error("Fatal error:", err);
-    process.exit(1);
+    job.status = "failed";
+    job.error = err.message;
+    job.endTime = Date.now();
   }
-})();
+}
+
+// POST /batch - Start a new batch transaction
+app.post("/batch", apiKeyAuth, async (req, res) => {
+  try {
+    const { rpc, token, to, count = 20, min = "0.01", max = "0.5", delay = 1.0, retries = 3, logDir = "logs" } = req.body;
+
+    if (!rpc || !token || !to) {
+      return res.status(400).json({ error: "Missing required fields: rpc, token, to" });
+    }
+
+    const jobId = `job_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    jobs.set(jobId, {
+      id: jobId,
+      status: "queued",
+      config: { rpc, token, to, count, min, max, delay, retries, logDir },
+      createdAt: Date.now(),
+      completed: 0,
+      transactions: []
+    });
+
+    // Execute in background
+    executeBatch(jobId, { rpc, token, to, count, min, max, delay, retries, logDir });
+
+    res.json({ 
+      jobId, 
+      status: "queued",
+      message: "Batch transaction started",
+      statusUrl: `/batch/${jobId}`
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /batch/:jobId - Get job status
+app.get("/batch/:jobId", apiKeyAuth, (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  
+  if (!job) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  const response = {
+    id: job.id,
+    status: job.status,
+    wallet: job.wallet,
+    balances: job.balances,
+    planned: job.planned,
+    completed: job.completed,
+    transactions: job.transactions,
+    createdAt: job.createdAt,
+    warnings: job.warnings
+  };
+
+  if (job.status === "completed") {
+    response.duration = job.duration;
+    response.logPath = job.logPath;
+    response.endTime = job.endTime;
+  }
+
+  if (job.status === "failed") {
+    response.error = job.error;
+    response.endTime = job.endTime;
+  }
+
+  res.json(response);
+});
+
+// GET /batch - List all jobs
+app.get("/batch", apiKeyAuth, (req, res) => {
+  const allJobs = Array.from(jobs.values()).map(job => ({
+    id: job.id,
+    status: job.status,
+    wallet: job.wallet,
+    completed: job.completed,
+    total: job.planned?.count || 0,
+    createdAt: job.createdAt,
+    duration: job.duration
+  }));
+
+  res.json({ jobs: allJobs, total: allJobs.length });
+});
+
+// DELETE /batch/:jobId - Delete a job from memory
+app.delete("/batch/:jobId", apiKeyAuth, (req, res) => {
+  const deleted = jobs.delete(req.params.jobId);
+  
+  if (!deleted) {
+    return res.status(404).json({ error: "Job not found" });
+  }
+
+  res.json({ message: "Job deleted" });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    timestamp: Date.now(),
+    activeJobs: jobs.size
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Start batch: POST http://localhost:${PORT}/batch`);
+  console.log(`Check status: GET http://localhost:${PORT}/batch/:jobId`);
+});
