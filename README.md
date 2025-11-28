@@ -8,9 +8,9 @@ Send multiple ERC20 token transfers on Linea.
 bun install
 ```
 
-Create `.env`:
-```
-PRIVATE_KEY=0x...
+Setup `.env`:
+```bash
+cp .env.example .env
 ```
 
 ## Usage
