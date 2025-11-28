@@ -4,7 +4,7 @@ export function parseArgs() {
   const args = minimist(process.argv.slice(2), {
     string: ["rpc", "token", "to", "min", "max", "log"],
     boolean: ["dry-run", "yes", "verbose"],
-    default: { count: 20, min: "0.01", max: "0.5", delay: 1.0, retries: 3, log: "linea-20", verbose: false },
+    default: { count: 20, min: "0.01", max: "0.5", delay: 1.0, retries: 3, log: "logs", verbose: false },
     alias: { h: "help" },
   });
 
@@ -22,7 +22,7 @@ export function parseArgs() {
    --yes        : skip confirmation prompt
    --delay      : seconds between txs (default 1.0)
    --retries    : max retries per tx (default 3)
-   --log        : path prefix for log files (default linea-20)
+   --log        : path prefix for log files (default logs)
    --verbose    : enable verbose logging
     `;
     console.log(helpText);

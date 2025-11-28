@@ -102,6 +102,7 @@ SUMMARY
     }
 
     const txLog = [];
+    const startTime = Date.now();
     for (let i = 0; i < planned.length; ++i) {
       const { display, units } = planned[i];
       if (units === 0n) {
@@ -163,17 +164,30 @@ SUMMARY
           await sleep(backoff);
           if (attempt >= args.retries) {
             console.error(`Max retries reached for tx #${i + 1}. Aborting remaining transactions.`);
-            const base = args.log || "linea-20";
-            fs.writeFileSync(base + ".txlog.json", JSON.stringify(txLog, null, 2));
+            const logDir = args.log || ".";
+            const timestamp = Math.floor(Date.now() / 1000);
+            const logPath = `${logDir}/${timestamp}.txlog.json`;
+            if (!fs.existsSync(logDir)) {
+              fs.mkdirSync(logDir, { recursive: true });
+            }
+            fs.writeFileSync(logPath, JSON.stringify(txLog, null, 2));
             process.exit(1);
           }
         }
       }
     }
 
-    const base = args.log || "linea-20";
-    fs.writeFileSync(base + ".txlog.json", JSON.stringify(txLog, null, 2));
-    console.log("All done. Tx log saved to", base + ".txlog.json");
+    const logDir = args.log || "logs";
+    const timestamp = Math.floor(Date.now() / 1000);
+    const logPath = `${logDir}/${timestamp}.txlog.json`;
+    if (!fs.existsSync(logDir)) {
+      fs.mkdirSync(logDir, { recursive: true });
+    }
+    fs.writeFileSync(logPath, JSON.stringify(txLog, null, 2));
+    
+    const endTime = Date.now();
+    const duration = ((endTime - startTime) / 1000).toFixed(2);
+    console.log(`All done in ${duration}s. Tx log saved to ${logPath}`);
   } catch (err) {
     console.error("Fatal error:", err);
     process.exit(1);
